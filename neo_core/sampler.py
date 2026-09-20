@@ -20,6 +20,8 @@ from .rng import randn_local
 
 logger = logging.getLogger("NeoSampler")
 
+OOM_ERRORS = (getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError), torch.cuda.OutOfMemoryError)
+
 
 # region settings (Neo "Settings > Sampler parameters" defaults)
 
@@ -316,6 +318,28 @@ class NeoCFGDenoiser:
 
         return denoised
 
+    def _calc_cond_batch(self, model, conds, x, timestep, model_options):
+        import comfy.model_management as mm
+        import comfy.samplers
+
+        run = self.run
+        if run.tile_size is None:
+            try:
+                return comfy.samplers.calc_cond_batch(model, conds, x, timestep, model_options)
+            except OOM_ERRORS:
+                mm.soft_empty_cache()
+                run.tile_size = 128  # latent pixels (= 1024 px)
+                logger.warning("[Neo] 采样显存不足，自动切换为分块采样（tile 1024px，重叠 128px）")
+        while True:
+            try:
+                return tiled_calc_cond_batch(model, conds, x, timestep, model_options, run.tile_size, max(8, run.tile_size // 8))
+            except OOM_ERRORS:
+                mm.soft_empty_cache()
+                if run.tile_size <= 32:
+                    raise
+                run.tile_size //= 2
+                logger.warning(f"[Neo] 分块采样仍显存不足，缩小到 {run.tile_size * 8}px")
+
     def _sampling_function(self, x, timestep, uncond, cond, cond_scale, model_options):
         import comfy.samplers
 
@@ -332,7 +356,7 @@ class NeoCFGDenoiser:
             args = {"conds": conds, "input": x, "sigma": timestep, "model": model, "model_options": model_options}
             out = model_options["sampler_calc_cond_batch_function"](args)
         else:
-            out = comfy.samplers.calc_cond_batch(model, conds, x, timestep, model_options)
+            out = self._calc_cond_batch(model, conds, x, timestep, model_options)
 
         # ComfyUI-style pre-cfg hooks (installed by ComfyUI nodes)
         for fn in model_options.get("sampler_pre_cfg_function", []):
@@ -354,6 +378,51 @@ class NeoCFGDenoiser:
             cfg_result = fn(args)
 
         return cfg_result
+
+
+def _tile_ramp(length, overlap, at_start, at_end, device):
+    r = torch.ones(length, device=device)
+    ov = min(overlap, length)
+    if ov > 0:
+        fade = torch.linspace(1.0 / (ov + 1), 1.0, ov, device=device)
+        if at_start:
+            r[:ov] = torch.minimum(r[:ov], fade)
+        if at_end:
+            r[-ov:] = torch.minimum(r[-ov:], fade.flip(0))
+    return r
+
+
+def _tile_starts(size, tile, overlap):
+    if size <= tile:
+        return [0]
+    stride = tile - overlap
+    starts = list(range(0, size - tile, stride))
+    starts.append(size - tile)
+    return starts
+
+
+def tiled_calc_cond_batch(model, conds, x, timestep, model_options, tile, overlap):
+    """VRAM fallback (not part of Neo): evaluate the model on overlapping spatial tiles and blend them
+    (MultiDiffusion style). Only used after a real out-of-memory error."""
+    import comfy.samplers
+
+    H, W = x.shape[-2], x.shape[-1]
+    outs = None
+    weight = torch.zeros((H, W), device=x.device)
+    for ys in _tile_starts(H, tile, overlap):
+        for xs in _tile_starts(W, tile, overlap):
+            th, tw = min(tile, H), min(tile, W)
+            xt = x[..., ys : ys + th, xs : xs + tw]
+            ot = comfy.samplers.calc_cond_batch(model, conds, xt, timestep, model_options)
+            wy = _tile_ramp(th, overlap, ys > 0, ys + th < H, x.device)
+            wx = _tile_ramp(tw, overlap, xs > 0, xs + tw < W, x.device)
+            w = wy[:, None] * wx[None, :]
+            if outs is None:
+                outs = [torch.zeros_like(x) for _ in ot]
+            for o, t in zip(outs, ot):
+                o[..., ys : ys + th, xs : xs + tw] += t * w
+            weight[ys : ys + th, xs : xs + tw] += w
+    return [o / weight for o in outs]
 
 
 def _join_dicts(base_dict, update_dict):
@@ -398,6 +467,7 @@ class NeoRun:
     callback: object = None
     extra_generation_params: dict = field(default_factory=dict)
     last_denoised: object = None
+    tile_size: object = None  # set when the VRAM fallback kicks in
 
     # ---- sd_samplers_kdiffusion.KDiffusionSampler.get_sigmas ----
     def get_sigmas(self, linker, steps):

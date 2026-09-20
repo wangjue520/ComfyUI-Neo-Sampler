@@ -15,7 +15,7 @@ Put the whole `ComfyUI-Neo-Sampler` folder into `ComfyUI/custom_nodes/`, then re
 
 Dependencies (`lark`, `torchsde`, `scipy`) are installed automatically into the Python that runs ComfyUI on first load (works with the embedded Python of portable packages too). If automatic installation fails, the console prints the command you need to run manually.
 
-### The three nodes
+### The three core nodes
 
 | Node | Where to place it | What it does |
 |---|---|---|
@@ -32,9 +32,24 @@ CLIP ─→ (LoRA) ─→ Neo CLIP Converter ─→ CLIPTextEncode(positive) ─
 Neo Empty Latent ───────────────────────────────────────────────→ Neo KSampler.latent_image
 ```
 
-Hires.fix wiring: first Neo KSampler → Latent upscale → second Neo KSampler (set denoise to the redraw strength and select "Hires.fix" mode). The second sampler automatically reuses the seed from the first pass and regenerates noise at the new size, exactly like Neo.
+Hires.fix wiring: first Neo KSampler → Latent upscale (or Neo Hires Upscale) → second Neo KSampler (set denoise to the redraw strength and select "Hires.fix" mode). The second sampler automatically reuses the seed from the first pass and regenerates noise at the new size, exactly like Neo.
 
 img2img wiring: VAE Encode → the `latent` input of Neo Empty Latent → Neo KSampler.
+
+### Additional nodes
+
+| Node | What it does |
+|---|---|
+| **Neo Prompt LoRA** | Loads `<lora:…>` from the positive prompt onto MODEL/CLIP following Neo's rules and passes them on, so every downstream node (including inpainting) carries those LoRAs. Turn off the sampler's `prompt_lora` when using this node |
+| **Neo Turbo Boost** | Loads a Turbo LoRA (model only) and switches the Neo KSampler to few steps and low CFG through its `turbo` output. When the whole group is bypassed, the model passes through unchanged and the sampler falls back to its own settings |
+| **Neo Hires Upscale** | Replicates Neo's hires-fix upscale step: the target size is rounded to Resolution Step (default 64); either latent interpolation or "upscale model → Lanczos → VAE encode", with the same tiling as Neo for the upscale model. Connect the output directly to a second Neo KSampler (Hires.fix mode) — the seed and prompt schedule carry over automatically |
+
+**Automatic tiling when VRAM runs out:**
+- VAE: handled by ComfyUI itself.
+- Upscale model: the tile size is halved automatically on retry.
+- Neo KSampler: automatically switches to 1024px overlapping tiled sampling, halving further if still out of memory.
+
+This only triggers on an actual out-of-memory error; under normal conditions results stay bit-identical with Neo.
 
 ### Prompt LoRA (`<lora:name:weight>`)
 
@@ -44,7 +59,7 @@ The Neo KSampler's `prompt_lora` option is on by default and loads LoRAs from th
 - Lookup rules: first matched by filename (without extension, subfolders included), then by the `ss_output_name` alias inside the file. Missing LoRAs are skipped with a console error, same as Neo.
 - Internally it calls the exact same functions as the "LoRA Loader" node, so both approaches are bit-identical (tested).
 
-Note: if you use a LoRA Loader node, turn `prompt_lora` off, otherwise the same LoRA is applied twice.
+Note: if you use a LoRA Loader node or the Neo Prompt LoRA node, turn `prompt_lora` off, otherwise the same LoRA is applied twice.
 
 ### Mapping to Neo settings
 
@@ -99,7 +114,7 @@ This plugin contains code ported from Forge Neo and is therefore licensed under 
 
 依赖（`lark`、`torchsde`、`scipy`）会在首次加载时自动安装到运行 ComfyUI 的那个 Python 里（整合包的 `python_embeded` 也可以）。如果自动安装失败，控制台会打印出需要手动执行的命令。
 
-### 三个节点
+### 三个核心节点
 
 | 节点 | 放在哪里 | 作用 |
 |---|---|---|
@@ -116,9 +131,24 @@ CLIP ─→ (LoRA) ─→ Neo CLIP 转换器 ─→ CLIPTextEncode(正) ─→ N
 Neo 空Latent ─────────────────────────────────────────→ Neo K采样器.latent_image
 ```
 
-高清修复的连法：第一个 Neo K采样器 → Latent 放大 → 第二个 Neo K采样器（denoise 设为重绘幅度，模式选「Hires.fix」）。第二个采样器会自动沿用第一阶段的种子，并在新尺寸上重新生成噪声，这和 Neo 的做法一致。
+高清修复的连法：第一个 Neo K采样器 → Latent 放大（或 Neo 高清修复放大）→ 第二个 Neo K采样器（denoise 设为重绘幅度，模式选「Hires.fix」）。第二个采样器会自动沿用第一阶段的种子，并在新尺寸上重新生成噪声，这和 Neo 的做法一致。
 
 图生图的连法：VAE 编码 → Neo 空Latent 的 `latent` 输入 → Neo K采样器。
+
+### 附加节点
+
+| 节点 | 作用 |
+|---|---|
+| **Neo 提示词 LoRA** | 把正面提示词里的 `<lora:…>` 按 Neo 规则加载到 MODEL/CLIP 上并输出，下游所有节点（包括局部重绘）都会带上这些 LoRA。用了它就要关掉采样器的 `prompt_lora` |
+| **Neo Turbo 加速** | 加载 Turbo LoRA（只作用于模型），并通过 `turbo` 输出把 Neo K采样器切换成少步数、低 CFG。整组旁路时，模型原样通过，采样器恢复自己的设置 |
+| **Neo 高清修复放大** | 复刻 Neo 高清修复的放大步骤：目标尺寸按 Resolution Step 取整（默认 64），可以用 Latent 插值，也可以走「放大模型 → Lanczos → VAE 编码」，放大模型的分块方式与 Neo 相同。输出直接接第二个 Neo K采样器（Hires.fix 模式），会自动沿用种子和提示词调度 |
+
+**显存不足时自动分块**：
+- VAE：由 ComfyUI 内置处理。
+- 放大模型：分块大小自动减半重试。
+- Neo K采样器：自动切换成 1024px 重叠分块采样，还不够就继续减半。
+
+这只在真正遇到显存不足时才会触发，平时结果仍与 Neo 逐比特一致。
 
 ### 提示词 LoRA（`<lora:名称:权重>`）
 
@@ -128,7 +158,7 @@ Neo K采样器的 `prompt_lora` 默认开启，会按 Neo 的规则加载正面�
 - 查找规则：先按文件名（不含扩展名，子文件夹里的也算）匹配，找不到再按文件内的 `ss_output_name` 别名匹配。找不到的 LoRA 会被跳过，并在控制台报错，这些都和 Neo 一样。
 - 内部调用的函数和「LoRA 加载器」节点完全相同，所以两种方式的结果逐比特一致（已测试）。
 
-注意：用了 LoRA 加载器就要把 `prompt_lora` 关掉，否则同一个 LoRA 会被叠加两次。
+注意：用了 LoRA 加载器或 Neo 提示词 LoRA 节点就要把 `prompt_lora` 关掉，否则同一个 LoRA 会被叠加两次。
 
 ### 和 Neo 设置的对应关系
 

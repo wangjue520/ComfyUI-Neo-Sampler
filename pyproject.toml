@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-neo-sampler"
 description = "Replicates Forge Neo (neo branch) sampling, RNG and prompt encoding inside ComfyUI - same parameters, same results."
-version = "1.0.0"
+version = "1.1.0"
 license = { text = "AGPL-3.0-only" }
 dependencies = ["lark", "torchsde", "scipy"]
 

@@ -72,7 +72,8 @@ class NeoPrompt:
 
     def static(self):
         """Fallback tensor for ordinary samplers: the prompt as Neo would see it at the last step."""
-        sched = prompt_parser.get_learned_conditioning_prompt_schedules([self.text], 1)[0]
+        text = re.sub(re_extra_net, "", self.text)  # <lora:...> would otherwise be encoded as text
+        sched = prompt_parser.get_learned_conditioning_prompt_schedules([text], 1)[0]
         text = sched[-1][1]
         return self.encode([text])[text]
 
@@ -303,7 +304,7 @@ class _CondBuilder:
         parts = []
         for tensor, d in conditioning:
             payload = d.get("neo_prompt", None) or getattr(tensor, "neo_prompt", None)
-            if payload is not None and id(payload.clip) in self.clip_map:
+            if payload is not None and id(getattr(payload, "clip", None)) in self.clip_map:
                 if id(payload) not in self._rebound:
                     self._rebound[id(payload)] = payload.rebind(self.clip_map[id(payload.clip)])
                 payload = self._rebound[id(payload)]
@@ -492,6 +493,7 @@ class NeoKSampler:
                 "ngms": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 8.0, "step": 0.05, "tooltip": "Skip Negative Prompt during Later Steps (sigma)"}),
                 "ngms_all_steps": ("BOOLEAN", {"default": False}),
                 "extra_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Extra Noise Multiplier for img2img and Hires. fix"}),
+                "turbo": ("NEO_TURBO", {"tooltip": "接「Neo Turbo 加速」。接上并启用时覆盖采样器/调度器/步数/CFG"}),
                 "prompt_lora": ("BOOLEAN", {"default": True, "label_on": "启用 <lora:…>", "label_off": "关闭", "tooltip": "按 Neo 规则加载正面提示词里的 <lora:名称:权重>（同时作用于模型和文本编码器）。已经用 LoRA 加载器加载的话请关闭，否则会叠加两次"}),
             },
         }
@@ -504,7 +506,7 @@ class NeoKSampler:
     def sample(self, model, positive, negative, latent_image, sampler_name, scheduler, steps, cfg, denoise, denoise_mode, shift,
                eta=1.0, eta_ddim=0.0, s_churn=0.0, s_tmin=0.0, s_tmax=0.0, s_noise=1.0, sigma_min=0.0, sigma_max=0.0, rho=0.0,
                always_discard_penultimate_sigma=False, sgm_noise_multiplier=False, beta_alpha=0.6, beta_beta=0.6,
-               skip_early_cfg=0.0, ngms=0.0, ngms_all_steps=False, extra_noise=0.0, prompt_lora=True):
+               skip_early_cfg=0.0, ngms=0.0, ngms_all_steps=False, extra_noise=0.0, prompt_lora=True, turbo=None):
         meta = latent_image.get("neo_rng")
         if meta is None:
             raise ValueError("Neo K采样器：latent 必须来自「Neo 空Latent」（图生图时把 VAE 编码结果接到 Neo 空Latent 的 latent 输入）")
@@ -525,8 +527,12 @@ class NeoKSampler:
         if shift > 0:
             model = _apply_shift(model, shift)
 
-        config = SAMPLERS[sampler_name]
         is_txt2img = meta.get("mode") == "txt2img" and torch.count_nonzero(samples) == 0
+        if turbo is not None:
+            sampler_name, scheduler, cfg = turbo["sampler_name"], turbo["scheduler"], turbo["cfg"]
+            steps = turbo["steps"] if is_txt2img else turbo["hires_steps"]
+            logger.info(f"[Neo] Turbo: {sampler_name} / {scheduler} / {steps} 步 / CFG {cfg}")
+        config = SAMPLERS[sampler_name]
         if is_txt2img and denoise < 1.0:
             logger.warning("[Neo] 文生图没有重绘幅度，denoise 已忽略")
 
